@@ -48,6 +48,7 @@ class VllmStrategy(InferenceStrategy):
         vllm_config = copy.deepcopy(self.worker_config.strategy_args.strategy_config)
         engine_mode = vllm_config.pop("engine_mode", "sync")  # sync/async
         self.pending_size = vllm_config.pop("pending_size", 1)
+        self.sleep_level = vllm_config.pop("sleep_level", 1)
         self.command_queue = queue.Queue()
 
         if self.worker_config.model_args.dtype == "fp32":
@@ -170,10 +171,22 @@ class VllmStrategy(InferenceStrategy):
                     sampling_params = create_sampling_params_for_vllm(
                         gen_kwargs={**generation_config, "max_new_tokens": max_new_tokens}
                     )
-                    prompt_token_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
-                    self.model.add_requests(
-                        request_ids=[request_id], prompt_token_ids=prompt_token_ids, sampling_params=sampling_params
-                    )
+                    if "multi_modal_data" in batch.non_tensor_batch:
+                        prompt_token_ids = [
+                            batch.non_tensor_batch["multi_modal_data"][0]
+                            ["prompt_token_ids"]
+                        ]
+                        multi_modal_data = [
+                            batch.non_tensor_batch["multi_modal_data"][0]
+                            ["multi_modal_data"]
+                        ]
+                    else:
+                        prompt_token_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
+                        multi_modal_data = None
+                    self.model.add_requests(request_ids=[request_id],
+                                            prompt_token_ids=prompt_token_ids,
+                                            sampling_params=sampling_params,
+                                            multi_modal_data=multi_modal_data)
                 elif command == GenerateRequestType.ABORT:
                     request_id = batch.meta_info["request_id"]
                     self.model.abort_request(request_id=request_id)
@@ -237,7 +250,7 @@ class VllmStrategy(InferenceStrategy):
 
     def offload_states(self, include=None, non_blocking=False):
         if include is None or OffloadStateType.model_params in include:
-            self.model.offload_states()
+            self.model.offload_states(self.sleep_level)
         self.recv_manager.clear()
         gc.collect()
         torch.cuda.empty_cache()
@@ -305,7 +318,8 @@ def compare_sampling_params(params1: SamplingParams, params2: SamplingParams) ->
         "top_k",
         "max_tokens",
         "n",
-        "stop_token_ids" "presence_penalty",
+        "stop_token_ids", 
+        "presence_penalty",
         "frequency_penalty",
         "repetition_penalty",
         "min_p",

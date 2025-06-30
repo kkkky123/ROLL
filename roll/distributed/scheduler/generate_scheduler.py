@@ -147,7 +147,14 @@ class GenerateScheduler:
                 prompt_ids = data.batch["prompt_id"]
                 input_ids = input_ids.repeat(num_return_sequences, 1)
                 attention_mask = attention_mask.repeat(num_return_sequences, 1)
-                position_ids = position_ids.repeat(num_return_sequences, 1)
+                if position_ids.dim() == 3:  # (bsz, 3, seqlen)
+                    position_ids = position_ids.repeat(num_return_sequences, 1, 1)
+                    non_tensor_batch = dict(
+                        (k, np.tile(v, num_return_sequences))
+                        for k, v in data.non_tensor_batch.items())
+                else:
+                    position_ids = position_ids.repeat(num_return_sequences, 1)
+                    non_tensor_batch = {}
                 prompt_ids = prompt_ids.unsqueeze(-1).repeat(num_return_sequences, 1)
 
                 data = DataProto(
@@ -160,6 +167,7 @@ class GenerateScheduler:
                         },
                         batch_size=output_batch_size,
                     ),
+                    non_tensor_batch=non_tensor_batch,
                     meta_info=data.meta_info,
                 )
             self.is_completed = False
@@ -745,32 +753,36 @@ class GlobalCounter:
         return self.value
 
 
-@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 256})
-class OneRequestScheduler:
-    def __init__(self, infer_worker, pipeline_config):
-        self.infer_worker = infer_worker
+@ray.remote(concurrency_groups={"single_thread": 1, "multi_thread": 2048})
+class RequestScheduler:
+    def __init__(self, infer_cluster, pipeline_config):
+        self.infer_cluster = infer_cluster
         self.pipeline_config = pipeline_config
-        self.request_counter = GlobalCounter.options(
-            name=f"SimpleRequestSchedulerRequestCounter",
-            get_if_exists=True,
-            namespace=RAY_NAMESPACE,
-        ).remote()
-        self.request_2_response = ThreadSafeDict()
-        self.request_id = None
-        self.event = threading.Event()
+        self.request_dict = ThreadSafeDict()
+        self.request_id_2_dp_rank = {}
+        self.src_rank2_dp_rank = {}
+        self.worker_iter = itertools.cycle(range(self.infer_cluster.world_size))
 
+    @ray.method(concurrency_group="multi_thread")
     def generate_one_request(self, data: DataProto):
+        assert "request_id" in data.meta_info, f"data {data.meta_info} should have key 'request_id'"
 
-        request_id = str(ray.get(self.request_counter.get_value.remote()))
-        data.meta_info["request_id"] = request_id
-        self.request_id = request_id
-        ray.get(self.infer_worker.add_request.remote(command=GenerateRequestType.ADD, data=data))
+        request_id = data.meta_info["request_id"]
+        src_rank = data.meta_info["src_rank"]
+        if src_rank not in self.src_rank2_dp_rank:
+            dp_rank = next(self.worker_iter)
+            self.src_rank2_dp_rank[src_rank] = dp_rank
 
-        self.event.wait()
+        dp_rank = self.src_rank2_dp_rank[src_rank]
+        # send request to one worker
+        ray.get(self.infer_cluster.workers[dp_rank].add_request.remote(command=GenerateRequestType.ADD, data=data))
+        data.meta_info.pop("response_callback_fn")
+        self.request_id_2_dp_rank[request_id] = dp_rank
 
-        response_data = self.request_2_response[request_id]
-
+        response_data: DataProto = self.request_dict.pop(data.meta_info["request_id"])
+        self.request_id_2_dp_rank.pop(data.meta_info["request_id"])
         if response_data is None:
+            # request aborted
             return None
 
         # postprocess_generate, input_ids, attention_mask, left pad
@@ -793,21 +805,20 @@ class OneRequestScheduler:
         request_repeat = data.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info
-        self.request_2_response.clear()
         return output
 
     @ray.method(concurrency_group="multi_thread")
     def report_response(self, data: DataProto):
-        self.request_2_response[data.meta_info["request_id"]] = data
-        self.event.set()
+        self.request_dict.set(data.meta_info["request_id"], data)
 
     @ray.method(concurrency_group="multi_thread")
     def abort_request(self, data: DataProto):
-        if self.request_id is not None:
+        request_id = data.meta_info["request_id"]
+        if request_id in self.request_id_2_dp_rank:
+            infer_worker = self.infer_cluster.workers[self.request_id_2_dp_rank[request_id]]
             ray.get(
-                self.infer_worker.add_request.remote(
-                    command=GenerateRequestType.ABORT, data=DataProto(meta_info={"request_id": self.request_id})
+                infer_worker.add_request.remote(
+                    command=GenerateRequestType.ABORT, data=DataProto(meta_info={"request_id": request_id})
                 )
             )
-            self.request_2_response[self.request_id] = None
-            self.event.set()
+            self.request_dict.set(request_id, None)
